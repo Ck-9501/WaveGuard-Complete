@@ -257,6 +257,21 @@ function computeClassProbs(scenario) {
   return labels.map((label, i) => ({ label, value: vals[i] }));
 }
 
+// Centralized inspection-volume dataset (last 7 days). All "packages inspected"
+// figures across the dashboard KPI and analytics charts derive from this single
+// source of truth. Total ≈ 8,000 packages inspected over 7 days.
+const INSPECTION_VOLUME_DATA = [
+  { day: "D1", volume: 980 },
+  { day: "D2", volume: 1120 },
+  { day: "D3", volume: 1250 },
+  { day: "D4", volume: 1080 },
+  { day: "D5", volume: 1300 },
+  { day: "D6", volume: 1050 },
+  { day: "D7", volume: 1284 },
+];
+const INSPECTION_VOLUME_TOTAL = INSPECTION_VOLUME_DATA.reduce((sum, d) => sum + d.volume, 0);
+const PACKAGES_INSPECTED_TODAY = INSPECTION_VOLUME_DATA[INSPECTION_VOLUME_DATA.length - 1].volume;
+
 const PRODUCT_TYPES = ["Automotive Component", "Lithium Battery Pack", "Solar PV Component", "Industrial Casting", "Electronics", "Other"];
 const PACKAGE_TYPES = ["Cardboard", "Plastic", "Wood", "Metal", "Composite", "Other"];
 const ZONES = ["Zone A — Inbound Dock", "Zone B — Pre-Dispatch", "Zone C — QA Bay"];
@@ -587,7 +602,7 @@ function DashboardPage({ history, setPage, openInspection, runDemo }) {
       />
 
       <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 16 }}>
-        <KPICard icon={Package} label="Packages Inspected Today" value="1,284" sub="+6.2% vs yesterday" />
+        <KPICard icon={Package} label="Packages Inspected Today" value={PACKAGES_INSPECTED_TODAY.toLocaleString()} sub="+6.2% vs yesterday" />
         <KPICard icon={ShieldCheck} label="Passed" value="1,197" sub="93.2% pass rate" accent="var(--green)" />
         <KPICard icon={AlertTriangle} label="Anomalies Detected" value="87" sub="6.8% of total" accent="var(--amber)" />
         <KPICard icon={ShieldAlert} label="High Risk" value="12" sub="Held for secondary inspection" accent="var(--red)" />
@@ -1274,9 +1289,7 @@ function AnalyticsPage({ history }) {
     history.forEach((r) => { m[r.product] = (m[r.product] || 0) + (r.result === "ANOMALY" ? 1 : 0); });
     return Object.entries(m).map(([name, value]) => ({ name, value }));
   }, [history]);
-  const volumeData = useMemo(() => Array.from({ length: 14 }, (_, i) => ({
-    day: `D${i + 1}`, volume: Math.round(60 + Math.sin(i / 2) * 30 + (i % 3) * 8)
-  })), []);
+  const volumeData = INSPECTION_VOLUME_DATA;
   const riskDist = [
     { name: "Low", value: 1197, color: "var(--green)" },
     { name: "Medium", value: 41, color: "var(--amber)" },
@@ -1295,7 +1308,7 @@ function AnalyticsPage({ history }) {
         </>}
       />
       <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 16 }}>
-        <KPICard icon={Package} label="Total Inspections" value="8,942" sub={range} />
+        <KPICard icon={Package} label="Total Inspections" value={INSPECTION_VOLUME_TOTAL.toLocaleString()} sub={range} />
         <KPICard icon={ShieldCheck} label="Pass Rate" value="93.2%" accent="var(--green)" />
         <KPICard icon={AlertTriangle} label="Anomaly Rate" value="6.8%" accent="var(--amber)" />
         <KPICard icon={ShieldAlert} label="High Risk Rate" value="1.3%" accent="var(--red)" />
