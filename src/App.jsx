@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
 import {
   LineChart, Line, AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, RadarChart,
-  PolarGrid, PolarAngleAxis, Radar, Legend
+  PolarGrid, PolarAngleAxis, Radar, Legend, ReferenceLine
 } from "recharts";
 import {
   Radio, LayoutDashboard, ScanLine, Activity, BrainCircuit, History,
@@ -109,7 +109,7 @@ const GlobalStyle = () => (
 );
 
 /* ============================================================
-   MOCK DATA / SIGNAL GENERATION
+   SIGNAL / SCENARIO SIMULATION PRIMITIVES
    ============================================================ */
 const SUBCARRIERS = 64;
 
@@ -234,8 +234,11 @@ function computeFeatures(scenario) {
   ];
 }
 
-function computeClassProbs(scenario) {
-  const s = scenario.anomalyScore;
+// Accepts an explicit score so a record opened from the centralized
+// dataset shows probabilities consistent with ITS OWN anomaly score,
+// not a generic per-scenario default.
+function computeClassProbs(scenario, score) {
+  const s = score != null ? score : scenario.anomalyScore;
   const rest = 100 - s;
   const table = {
     normal: [s, rest * 0.5, rest * 0.3, rest * 0.2],
@@ -250,7 +253,6 @@ function computeClassProbs(scenario) {
   if (scenario.key === "unknown") {
     const total = raw.reduce((a, b) => a + b, 0);
     vals = raw.map((v) => (v / total) * (100 - s));
-    vals[0] += 0;
   }
   const sum = vals.reduce((a, b) => a + b, 0);
   vals = vals.map((v) => +((v / sum) * 100).toFixed(1));
@@ -260,51 +262,246 @@ function computeClassProbs(scenario) {
 const PRODUCT_TYPES = ["Automotive Component", "Lithium Battery Pack", "Solar PV Component", "Industrial Casting", "Electronics", "Other"];
 const PACKAGE_TYPES = ["Cardboard", "Plastic", "Wood", "Metal", "Composite", "Other"];
 const ZONES = ["Zone A — Inbound Dock", "Zone B — Pre-Dispatch", "Zone C — QA Bay"];
+const DESTINATIONS = ["Bengaluru", "Pune", "Chennai", "Delhi NCR", "Hyderabad"];
+const SENSOR_NODES = ["CSI-NODE-01", "CSI-NODE-02", "CSI-NODE-03"];
 
 function randPkgId(n) { return `PKG-${10480 + n}`; }
 function randInspId(n) { return `INS-${77210 + n}`; }
 
-function buildInitialHistory() {
-  const rows = [
-    { id: 0, pkg: "PKG-10491", product: "Automotive Component", scenario: "normal", conf: 96.2, time: "10:42 AM", date: "18 Aug 2026", inspector: "Demo Operator" },
-    { id: 1, pkg: "PKG-10492", product: "Industrial Casting", scenario: "structural", conf: 93.7, time: "10:44 AM", date: "18 Aug 2026", inspector: "Demo Operator" },
-    { id: 2, pkg: "PKG-10493", product: "Solar PV Component", scenario: "normal", conf: 98.1, time: "10:46 AM", date: "18 Aug 2026", inspector: "Demo Operator" },
-    { id: 3, pkg: "PKG-10494", product: "Lithium Battery Pack", scenario: "liquid", conf: 88.9, time: "10:51 AM", date: "18 Aug 2026", inspector: "Demo Operator" },
-    { id: 4, pkg: "PKG-10495", product: "Electronics", scenario: "displacement", conf: 79.4, time: "10:58 AM", date: "18 Aug 2026", inspector: "Demo Operator" },
-    { id: 5, pkg: "PKG-10496", product: "Automotive Component", scenario: "normal", conf: 97.0, time: "11:05 AM", date: "18 Aug 2026", inspector: "Demo Operator" },
-    { id: 6, pkg: "PKG-10497", product: "Industrial Casting", scenario: "unknown", conf: 71.2, time: "11:12 AM", date: "18 Aug 2026", inspector: "Demo Operator" },
-  ].map((r) => ({
-    ...r,
-    inspId: randInspId(r.id),
-    result: SCENARIOS[r.scenario].classification === "NORMAL" ? "PASS" : "ANOMALY",
-    risk: SCENARIOS[r.scenario].risk,
-  }));
-  return rows;
+/* ============================================================
+   CENTRALIZED DEMO DATASET — single source of truth
+   ----------------------------------------------------------
+   Every KPI, chart, table and report in the app reads from
+   THIS dataset. Nothing is hard-coded independently elsewhere,
+   so sums are consistent by construction rather than by
+   coincidence: total = passed + all anomaly categories,
+   product/destination anomaly breakdowns sum to the same
+   anomaly total, risk buckets sum to the same package total,
+   and "today" always equals the latest day's real records.
+   ============================================================ */
+
+function lastNDates(n) {
+  const arr = [];
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  for (let i = n - 1; i >= 0; i--) {
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    arr.push(d);
+  }
+  return arr;
+}
+function fmtDate(d) {
+  return d.toLocaleDateString("en-US", { month: "short", day: "2-digit" });
 }
 
-function buildInspection(scenarioKey, form, seed) {
-  const scenario = SCENARIOS[scenarioKey];
+function distributeProportionally(total, weights) {
+  const entries = Object.entries(weights);
+  const shareTotal = entries.reduce((a, [, v]) => a + v, 0) || 1;
+  const floors = entries.map(([k, v]) => {
+    const exact = (v / shareTotal) * total;
+    return { k, val: Math.floor(exact), rem: exact - Math.floor(exact) };
+  });
+  const assigned = floors.reduce((a, f) => a + f.val, 0);
+  const remainder = Math.round(total - assigned);
+  const order = [...floors].sort((a, b) => b.rem - a.rem);
+  for (let i = 0; i < remainder; i++) order[i % order.length].val += 1;
+  const result = {};
+  floors.forEach((f) => { result[f.k] = f.val; });
+  return result;
+}
+
+function weightedPick(rnd, weights) {
+  const entries = Object.entries(weights);
+  const r = rnd();
+  let acc = 0;
+  for (const [k, w] of entries) {
+    acc += w;
+    if (r <= acc) return k;
+  }
+  return entries[entries.length - 1][0];
+}
+
+const PRODUCT_WEIGHTS = {
+  "Automotive Component": 0.24, "Industrial Casting": 0.21, "Solar PV Component": 0.20,
+  "Lithium Battery Pack": 0.19, "Electronics": 0.16,
+};
+const DESTINATION_WEIGHTS = { "Bengaluru": 0.30, "Pune": 0.23, "Chennai": 0.20, "Delhi NCR": 0.16, "Hyderabad": 0.11 };
+const ANOMALY_TYPE_WEIGHTS = { structural: 0.14, displacement: 0.32, liquid: 0.29, unknown: 0.25 };
+
+function genDailyCounts(days, seed) {
+  const rnd = seededNoise(seed);
+  const counts = [];
+  for (let i = 0; i < days; i++) {
+    const base = 1080 + Math.sin(i / 4.3) * 90 + Math.cos(i / 9) * 60;
+    const noise = (rnd() - 0.5) * 140;
+    counts.push(Math.round(Math.max(880, Math.min(1360, base + noise))));
+  }
+  return counts;
+}
+
+function buildDemoDataset(days = 30, seed = 5173) {
+  const rnd = seededNoise(seed);
+  const dates = lastNDates(days);
+  const dailyCounts = genDailyCounts(days, seed + 1);
+  const records = [];
+  let pkgN = 10480;
+  let idN = 77210;
+  for (let d = 0; d < days; d++) {
+    const dayDate = dates[d];
+    const dayAnomalyRate = 0.05 + rnd() * 0.04;
+    const count = dailyCounts[d];
+    for (let i = 0; i < count; i++) {
+      pkgN += 1; idN += 1;
+      const product = weightedPick(rnd, PRODUCT_WEIGHTS);
+      const destination = weightedPick(rnd, DESTINATION_WEIGHTS);
+      const isAnomaly = rnd() < dayAnomalyRate;
+      const scenarioKey = isAnomaly ? weightedPick(rnd, ANOMALY_TYPE_WEIGHTS) : "normal";
+      const scenario = SCENARIOS[scenarioKey];
+      const jitter = (rnd() - 0.5) * 6;
+      const anomalyScore = Math.max(1, Math.min(99, +(scenario.anomalyScore + jitter).toFixed(1)));
+      const confidence = Math.max(55, Math.min(99.8, +(100 - Math.abs(jitter) * 1.6 - rnd() * 2).toFixed(1)));
+      const hour = 6 + Math.floor(rnd() * 16);
+      const minute = Math.floor(rnd() * 60);
+      const second = Math.floor(rnd() * 60);
+      const ts = new Date(dayDate);
+      ts.setHours(hour, minute, second, 0);
+      const inspId = `INS-${idN}`;
+      records.push({
+        id: inspId, inspId,
+        pkg: `PKG-${pkgN}`,
+        shipmentId: `SHP-${20000 + pkgN}`,
+        product, destination,
+        scenario: scenarioKey,
+        result: scenarioKey === "normal" ? "PASS" : "ANOMALY",
+        risk: scenario.risk,
+        anomalyScore, conf: confidence,
+        sensorNode: SENSOR_NODES[Math.floor(rnd() * SENSOR_NODES.length)],
+        baselineDeviation: +(scenario.driftAmp * 40 + rnd() * 6).toFixed(1),
+        amplitudeDeviation: +(scenario.driftAmp * 100 + rnd() * 8).toFixed(1),
+        phaseDeviation: +(scenario.driftPhase * 100 + rnd() * 8).toFixed(1),
+        dayIndex: d,
+        date: fmtDate(dayDate),
+        time: ts.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        timestamp: ts,
+        inspector: "Demo Operator",
+      });
+    }
+  }
+  return { records, dailyCounts, dates };
+}
+
+// Reduces a slice of records into every aggregate figure the dashboards
+// need in a single pass, so category sums equal their totals by
+// construction (each record contributes to exactly one bucket).
+function summarize(records) {
+  const byProduct = {};
+  Object.keys(PRODUCT_WEIGHTS).forEach((p) => { byProduct[p] = 0; });
+  const byDestination = {};
+  DESTINATIONS.forEach((d) => { byDestination[d] = 0; });
+  const detection = { Normal: 0, Structural: 0, Displacement: 0, Liquid: 0, Unknown: 0 };
+  let passed = 0, anomalies = 0, high = 0, medium = 0;
+  records.forEach((r) => {
+    if (r.result === "PASS") { passed += 1; detection.Normal += 1; return; }
+    anomalies += 1;
+    if (r.risk === "HIGH") high += 1; else medium += 1;
+    byProduct[r.product] = (byProduct[r.product] || 0) + 1;
+    byDestination[r.destination] = (byDestination[r.destination] || 0) + 1;
+    if (r.scenario === "structural") detection.Structural += 1;
+    else if (r.scenario === "displacement") detection.Displacement += 1;
+    else if (r.scenario === "liquid") detection.Liquid += 1;
+    else if (r.scenario === "unknown") detection.Unknown += 1;
+  });
+  const total = records.length;
   return {
-    inspectionId: randInspId(seed),
+    total, passed, anomalies, high, medium,
+    byProduct, byDestination, detection,
+    passRate: total ? (passed / total) * 100 : 0,
+    anomalyRate: total ? (anomalies / total) * 100 : 0,
+    highRiskRate: total ? (high / total) * 100 : 0,
+  };
+}
+
+function getRangeDays(rangeLabel) {
+  if (rangeLabel === "Today") return 1;
+  if (rangeLabel === "7 Days") return 7;
+  return 30; // "30 Days" and "Custom" (no custom range picker in this prototype)
+}
+
+function getRangeRecords(allRecords, dataset, rangeLabel) {
+  const days = getRangeDays(rangeLabel);
+  const minIdx = Math.max(0, dataset.dates.length - days);
+  return allRecords.filter((r) => r.dayIndex >= minIdx);
+}
+
+const HOUR_CURVE_WEIGHTS = (() => {
+  const w = {};
+  for (let h = 0; h < 24; h++) {
+    w[h] = (h >= 6 && h <= 21) ? 0.5 + Math.sin(((h - 6) / 15) * Math.PI) : 0.08;
+  }
+  return w;
+})();
+
+function buildHourlyBreakdown(total) {
+  const dist = distributeProportionally(total, HOUR_CURVE_WEIGHTS);
+  return Array.from({ length: 24 }, (_, h) => ({ hour: `${h}:00`, inspections: dist[h] || 0 }));
+}
+
+// Volume series for the Analytics "Packages Inspected Over Time" chart —
+// hourly points for Today, one point per calendar day for 7/30 Days.
+// The most recent point always includes any inspections run live in
+// this session, so it can never fall out of sync with the dashboard.
+function getVolumeSeries(dataset, rangeLabel, liveTodayCount = 0) {
+  const todayIdx = dataset.dates.length - 1;
+  if (rangeLabel === "Today") {
+    const total = dataset.dailyCounts[todayIdx] + liveTodayCount;
+    return buildHourlyBreakdown(total).map((h) => ({ date: h.hour, count: h.inspections }));
+  }
+  const days = getRangeDays(rangeLabel);
+  const start = Math.max(0, dataset.dates.length - days);
+  return dataset.dates.slice(start).map((d, i) => {
+    const idx = start + i;
+    const count = dataset.dailyCounts[idx] + (idx === todayIdx ? liveTodayCount : 0);
+    return { date: fmtDate(d), count };
+  });
+}
+
+const DATASET = buildDemoDataset(30, 5173);
+
+// Builds the full CSI-level inspection object (signal arrays, features,
+// classification, baseline reference) for whichever record is "active"
+// — either a fresh demo run or an existing dataset/history record.
+// `form` fields override the generated defaults so that opening a
+// record from Dashboard/History/Alerts reproduces EXACTLY the same
+// package/product/score/risk shown in the table it came from.
+function buildInspection(scenarioKey, form = {}, seed) {
+  const scenario = SCENARIOS[scenarioKey];
+  const anomalyScore = form.anomalyScore != null ? form.anomalyScore : scenario.anomalyScore;
+  const confidence = form.confidence != null ? form.confidence
+    : Math.max(60, Math.min(99.5, 100 - anomalyScore * 0.12 + (seed % 9)));
+  return {
+    inspectionId: form.inspectionId || randInspId(seed),
     packageId: form.packageId || randPkgId(seed),
     shipmentId: form.shipmentId || `SHP-${20500 + seed}`,
     productType: form.productType || PRODUCT_TYPES[0],
     packageType: form.packageType || PACKAGE_TYPES[0],
     origin: form.origin || "Pune, MH",
-    destination: form.destination || "Bengaluru, KA",
+    destination: form.destination || DESTINATIONS[0],
     zone: form.zone || ZONES[0],
-    timestamp: new Date(),
+    sensorNode: form.sensorNode || SENSOR_NODES[seed % SENSOR_NODES.length],
+    timestamp: form.timestamp || new Date(),
     scenarioKey,
     scenario,
     amplitudePhase: genSeries(scenario, 40, seed),
+    baseline: genSeries(SCENARIOS.normal, 40, seed),
     subcarrier: genSubcarrierResponse(scenario, seed),
     energy: genEnergySeries(scenario, 24, seed),
     features: computeFeatures(scenario),
-    classProbs: computeClassProbs(scenario),
-    anomalyScore: scenario.anomalyScore,
+    classProbs: computeClassProbs(scenario, anomalyScore),
+    anomalyScore, confidence,
     risk: scenario.risk,
     result: scenario.classification === "NORMAL" ? "PASS" : "ANOMALY DETECTED",
-    inspector: "Demo Operator",
+    inspector: form.inspector || "Demo Operator",
   };
 }
 
@@ -354,7 +551,7 @@ function SectionHeader({ title, subtitle, right }) {
         <h1 style={{ fontSize: 21, fontWeight: 700, margin: 0 }}>{title}</h1>
         {subtitle && <div style={{ fontSize: 13, color: "var(--text2)", marginTop: 4 }}>{subtitle}</div>}
       </div>
-      {right && <div style={{ display: "flex", gap: 10 }}>{right}</div>}
+      {right && <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>{right}</div>}
     </div>
   );
 }
@@ -391,6 +588,13 @@ const NAV = [
   { id: "config", label: "System Configuration", icon: Settings },
   { id: "about", label: "About", icon: Info },
 ];
+const PAGE_TITLES = {
+  ...Object.fromEntries(NAV.map((n) => [n.id, n.label])),
+  baseline: "Baseline Comparison",
+  replay: "Inspection Replay",
+  twin: "Package Digital Twin",
+  result: "Inspection Result",
+};
 
 function SubcarrierPulseStrip() {
   const bars = useMemo(() => Array.from({ length: 24 }, (_, i) => i), []);
@@ -468,7 +672,6 @@ function Sidebar({ page, setPage, collapsed, setCollapsed, alertCount }) {
 }
 
 function Topbar({ user, onLogout, page }) {
-  const titleMap = Object.fromEntries(NAV.map((n) => [n.id, n.label]));
   return (
     <div style={{
       height: 58, borderBottom: "1px solid var(--hair)", display: "flex", alignItems: "center",
@@ -478,7 +681,7 @@ function Topbar({ user, onLogout, page }) {
       <div style={{ display: "flex", alignItems: "center", gap: 10, color: "var(--text2)", fontSize: 13 }}>
         <span style={{ color: "var(--text3)" }}>WaveGuard AI</span>
         <ChevronRight size={13} color="var(--text3)" />
-        <span style={{ color: "var(--text)", fontWeight: 600 }}>{titleMap[page]}</span>
+        <span style={{ color: "var(--text)", fontWeight: 600 }}>{PAGE_TITLES[page] || "WaveGuard AI"}</span>
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
         <div className="badge mono" style={{ color: "var(--green)", background: "var(--green-dim)", border: "1px solid #1c4a35" }}>
@@ -564,17 +767,23 @@ function MiniLineChart({ data, dataKey, color, height = 46 }) {
   );
 }
 
-function DashboardPage({ history, setPage, openInspection, runDemo }) {
-  const activityData = useMemo(() => Array.from({ length: 24 }, (_, i) => ({
-    hour: `${i}:00`, inspections: Math.round(30 + Math.sin(i / 3) * 20 + (i > 9 && i < 18 ? 35 : 5) + (i % 4) * 3)
-  })), []);
+function DashboardPage({ dataset, allRecords, liveCount, setPage, openInspection, openTwin, runDemo }) {
+  const todayRecords = useMemo(() => getRangeRecords(allRecords, dataset, "Today"), [allRecords, dataset]);
+  const summaryToday = useMemo(() => summarize(todayRecords), [todayRecords]);
+  const todayIdx = dataset.dates.length - 1;
+  const yesterdayCount = dataset.dailyCounts[todayIdx - 1] || summaryToday.total;
+  const pctChange = yesterdayCount ? (((summaryToday.total - yesterdayCount) / yesterdayCount) * 100) : 0;
+
+  const activityData = useMemo(() => buildHourlyBreakdown(summaryToday.total), [summaryToday.total]);
   const donutData = [
-    { name: "Normal", value: 1197, color: "var(--green)" },
-    { name: "Structural", value: 34, color: "var(--red)" },
-    { name: "Displacement", value: 22, color: "var(--amber)" },
-    { name: "Liquid/Content", value: 19, color: "var(--blue)" },
-    { name: "Unknown", value: 12, color: "var(--text3)" },
+    { name: "Normal", value: summaryToday.detection.Normal, color: "var(--green)" },
+    { name: "Structural", value: summaryToday.detection.Structural, color: "var(--red)" },
+    { name: "Displacement", value: summaryToday.detection.Displacement, color: "var(--amber)" },
+    { name: "Liquid/Content", value: summaryToday.detection.Liquid, color: "var(--blue)" },
+    { name: "Unknown", value: summaryToday.detection.Unknown, color: "var(--text3)" },
   ];
+  const recent = useMemo(() => [...todayRecords].sort((a, b) => b.timestamp - a.timestamp).slice(0, 7), [todayRecords]);
+
   return (
     <div className="fade-up">
       <SectionHeader
@@ -587,10 +796,10 @@ function DashboardPage({ history, setPage, openInspection, runDemo }) {
       />
 
       <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 16 }}>
-        <KPICard icon={Package} label="Packages Inspected Today" value="1,284" sub="+6.2% vs yesterday" />
-        <KPICard icon={ShieldCheck} label="Passed" value="1,197" sub="93.2% pass rate" accent="var(--green)" />
-        <KPICard icon={AlertTriangle} label="Anomalies Detected" value="87" sub="6.8% of total" accent="var(--amber)" />
-        <KPICard icon={ShieldAlert} label="High Risk" value="12" sub="Held for secondary inspection" accent="var(--red)" />
+        <KPICard icon={Package} label="Packages Inspected Today" value={summaryToday.total.toLocaleString()} sub={`${pctChange >= 0 ? "+" : ""}${pctChange.toFixed(1)}% vs yesterday`} />
+        <KPICard icon={ShieldCheck} label="Passed" value={summaryToday.passed.toLocaleString()} sub={`${summaryToday.passRate.toFixed(1)}% pass rate`} accent="var(--green)" />
+        <KPICard icon={AlertTriangle} label="Anomalies Detected" value={summaryToday.anomalies.toLocaleString()} sub={`${summaryToday.anomalyRate.toFixed(1)}% of total`} accent="var(--amber)" />
+        <KPICard icon={ShieldAlert} label="High Risk" value={summaryToday.high.toLocaleString()} sub="Held for secondary inspection" accent="var(--red)" />
         <KPICard icon={BrainCircuit} label="Inspection Accuracy" value="91.4%" sub="Prototype demo metric" accent="var(--cyan)" />
       </div>
 
@@ -598,7 +807,7 @@ function DashboardPage({ history, setPage, openInspection, runDemo }) {
         <div className="card" style={{ flex: 2, minWidth: 340, padding: 18 }}>
           <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
             <div style={{ fontWeight: 700, fontSize: 14 }}>Inspection Activity</div>
-            <div style={{ fontSize: 11.5, color: "var(--text3)" }}>Last 24 hours</div>
+            <div style={{ fontSize: 11.5, color: "var(--text3)" }}>Today, by hour</div>
           </div>
           <ResponsiveContainer width="100%" height={220}>
             <AreaChart data={activityData}>
@@ -633,7 +842,7 @@ function DashboardPage({ history, setPage, openInspection, runDemo }) {
                 <span style={{ display: "flex", alignItems: "center", gap: 7, color: "var(--text2)" }}>
                   <span style={{ width: 8, height: 8, borderRadius: 2, background: d.color }} /> {d.name}
                 </span>
-                <span className="mono" style={{ color: "var(--text)" }}>{d.value}</span>
+                <span className="mono" style={{ color: "var(--text)" }}>{d.value.toLocaleString()}</span>
               </div>
             ))}
           </div>
@@ -652,7 +861,7 @@ function DashboardPage({ history, setPage, openInspection, runDemo }) {
               </tr>
             </thead>
             <tbody>
-              {history.slice(0, 7).map((r) => (
+              {recent.map((r) => (
                 <tr key={r.id} style={{ borderBottom: "1px solid var(--hair)", cursor: "pointer" }}
                   onClick={() => openInspection(r)}
                   onMouseEnter={(e) => e.currentTarget.style.background = "var(--panel2)"}
@@ -660,12 +869,20 @@ function DashboardPage({ history, setPage, openInspection, runDemo }) {
                   <td className="mono" style={{ padding: "12px 18px", fontWeight: 600 }}>{r.pkg}</td>
                   <td style={{ padding: "12px 18px", color: "var(--text2)" }}>{r.product}</td>
                   <td style={{ padding: "12px 18px" }}><ResultBadge result={r.result} /></td>
-                  <td className="mono" style={{ padding: "12px 18px" }}>{r.conf}%</td>
+                  <td className="mono" style={{ padding: "12px 18px" }} title="Model classification confidence">{r.conf}%</td>
                   <td style={{ padding: "12px 18px" }}><RiskBadge risk={r.risk} /></td>
                   <td className="mono" style={{ padding: "12px 18px", color: "var(--text3)" }}>{r.time}</td>
-                  <td style={{ padding: "12px 18px" }}><ChevronRight size={15} color="var(--text3)" /></td>
+                  <td style={{ padding: "12px 18px" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "flex-end" }}>
+                      <button className="btn-ghost btn" style={{ padding: 4 }} title="Digital Twin" onClick={(e) => { e.stopPropagation(); openTwin(r); }}><Package size={14} /></button>
+                      <ChevronRight size={15} color="var(--text3)" />
+                    </div>
+                  </td>
                 </tr>
               ))}
+              {recent.length === 0 && (
+                <tr><td colSpan={7} style={{ padding: 24, textAlign: "center", color: "var(--text3)" }}>No inspections recorded yet today.</td></tr>
+              )}
             </tbody>
           </table>
         </div>
@@ -682,7 +899,7 @@ function NewInspectionPage({ form, setForm, runDemo, startLive }) {
   const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }));
 
   const fillSample = () => setForm({
-    packageId: randPkgId(Math.floor(Math.random() * 900)),
+    packageId: randPkgId(500000 + Math.floor(Math.random() * 900)),
     shipmentId: `SHP-${20000 + Math.floor(Math.random() * 900)}`,
     productType: "Lithium Battery Pack",
     packageType: "Composite",
@@ -824,7 +1041,7 @@ function DemoRunStrip({ stepIndex, total, running }) {
 /* ============================================================
    LIVE CSI MONITOR
    ============================================================ */
-function LiveMonitorPage({ inspection, demo, connected, setConnected }) {
+function LiveMonitorPage({ inspection, demo, connected }) {
   const [subFilter, setSubFilter] = useState("All Subcarriers");
   const [tick, setTick] = useState(0);
   const [playing, setPlaying] = useState(true);
@@ -874,10 +1091,10 @@ function LiveMonitorPage({ inspection, demo, connected, setConnected }) {
 
       <div style={{ display: "flex", gap: 14, marginBottom: 16, flexWrap: "wrap" }}>
         <div className="card" style={{ padding: "12px 16px", display: "flex", alignItems: "center", gap: 10, flex: 1, minWidth: 190 }}>
-          {connected ? <Wifi size={16} color="var(--green)" /> : <WifiOff size={16} color="var(--text3)" />}
+          <Wifi size={16} color={connected ? "var(--green)" : "var(--cyan)"} />
           <div>
             <div style={{ fontSize: 10.5, color: "var(--text3)", textTransform: "uppercase" }}>CSI Sensor Status</div>
-            <div className="mono" style={{ fontSize: 13, fontWeight: 700, color: connected ? "var(--green)" : "var(--cyan)" }}>{connected ? "CONNECTED" : "DEMO MODE"}</div>
+            <div className="mono" style={{ fontSize: 13, fontWeight: 700, color: connected ? "var(--green)" : "var(--cyan)" }}>{connected ? "CONNECTED" : "SIMULATED ONLINE"}</div>
           </div>
         </div>
         {[
@@ -1024,7 +1241,7 @@ function SignalProcessingPanel({ demo, inspection }) {
 /* ============================================================
    AI ANALYSIS PAGE
    ============================================================ */
-function AIAnalysisPage({ inspection, demo, goResult }) {
+function AIAnalysisPage({ inspection, demo, goResult, setPage }) {
   const s = inspection.scenario;
   const running = demo?.active && demo.page === "ai-analysis" && demo.running;
   return (
@@ -1053,7 +1270,10 @@ function AIAnalysisPage({ inspection, demo, goResult }) {
         </div>
 
         <div className="card" style={{ flex: 1, minWidth: 300, padding: 18 }}>
-          <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 12 }}>Classification Probabilities</div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 12 }}>
+            <div style={{ fontWeight: 700, fontSize: 14 }}>Classification Probabilities</div>
+            <span style={{ fontSize: 10.5, color: "var(--text3)" }}>model confidence, not damage probability</span>
+          </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             {inspection.classProbs.map((c) => (
               <div key={c.label}>
@@ -1061,7 +1281,7 @@ function AIAnalysisPage({ inspection, demo, goResult }) {
                   <span style={{ color: "var(--text2)" }}>{c.label}</span>
                   <span className="mono" style={{ fontWeight: 700 }}>{c.value.toFixed(1)}%</span>
                 </div>
-                <ProgressBar value={c.value} color={c.label === s.classification.replace("STRUCTURAL ANOMALY", "Structural Anomaly") || c.label.toUpperCase() === s.classification ? s.color : "var(--hair-bright)"} />
+                <ProgressBar value={c.value} color={c.label.toUpperCase() === s.classification || (c.label === "Structural Anomaly" && s.classification === "STRUCTURAL ANOMALY") ? s.color : "var(--hair-bright)"} />
               </div>
             ))}
           </div>
@@ -1071,8 +1291,11 @@ function AIAnalysisPage({ inspection, demo, goResult }) {
       <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
         <div className="card" style={{ flex: 1, minWidth: 240, padding: 22, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
           <div style={{ fontSize: 11.5, color: "var(--text3)", textTransform: "uppercase", marginBottom: 8 }}>Overall Anomaly Score</div>
-          <div className="mono" style={{ fontSize: 42, fontWeight: 800, color: s.color }}>{s.anomalyScore.toFixed(1)}%</div>
-          <div style={{ marginTop: 10 }}><RiskBadge risk={s.risk} /></div>
+          <div className="mono" style={{ fontSize: 42, fontWeight: 800, color: s.color }}>{inspection.anomalyScore.toFixed(1)}%</div>
+          <div style={{ marginTop: 10 }}><RiskBadge risk={inspection.risk} /></div>
+          <div style={{ fontSize: 10.5, color: "var(--text3)", marginTop: 10, textAlign: "center", lineHeight: 1.5 }}>
+            Prototype anomaly score — deviation from baseline, not a validated probability of damage.
+          </div>
         </div>
         <div className="card" style={{ flex: 2, minWidth: 320, padding: 22 }}>
           <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 10 }}>Why was this package flagged?</div>
@@ -1085,9 +1308,12 @@ function AIAnalysisPage({ inspection, demo, goResult }) {
             AI-generated screening result. Secondary physical inspection is recommended for high-risk cases.
           </div>
           {!running && (
-            <button className="btn btn-primary" style={{ marginTop: 16 }} onClick={goResult}>
-              View Inspection Result <ArrowRight size={14} />
-            </button>
+            <div style={{ display: "flex", gap: 10, marginTop: 16, flexWrap: "wrap" }}>
+              <button className="btn btn-primary" onClick={goResult}>View Inspection Result <ArrowRight size={14} /></button>
+              <button className="btn" onClick={() => setPage("baseline")}><GitBranch size={14} /> Baseline Comparison</button>
+              <button className="btn" onClick={() => setPage("replay")}><Play size={14} /> Replay Inspection</button>
+              <button className="btn" onClick={() => setPage("twin")}><Package size={14} /> Digital Twin</button>
+            </div>
           )}
         </div>
       </div>
@@ -1115,13 +1341,14 @@ function ResultPage({ inspection, setPage, addNote }) {
         <div style={{ fontSize: 13, color: "var(--text2)", marginTop: 6 }}>{s.classification}</div>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 14, marginBottom: 16 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 14, marginBottom: 8 }}>
         {[
           ["Package ID", inspection.packageId],
           ["Inspection ID", inspection.inspectionId],
           ["Timestamp", inspection.timestamp.toLocaleString()],
           ["Product Type", inspection.productType],
           ["Anomaly Score", `${inspection.anomalyScore.toFixed(1)}%`],
+          ["Confidence", `${inspection.confidence.toFixed(1)}%`],
           ["Risk Level", inspection.risk],
           ["Package Type", inspection.packageType],
           ["Inspection Zone", inspection.zone],
@@ -1132,6 +1359,9 @@ function ResultPage({ inspection, setPage, addNote }) {
           </div>
         ))}
       </div>
+      <div style={{ fontSize: 11, color: "var(--text3)", marginBottom: 16, lineHeight: 1.5 }}>
+        Anomaly Score reflects deviation from the expected CSI baseline; Confidence reflects the model's classification confidence — neither is a validated probability of physical damage.
+      </div>
 
       <div className="card" style={{ padding: 18, marginBottom: 16, borderLeft: `3px solid ${s.color}` }}>
         <div style={{ fontSize: 11, color: "var(--text3)", textTransform: "uppercase", marginBottom: 6 }}>Recommended Action</div>
@@ -1141,6 +1371,9 @@ function ResultPage({ inspection, setPage, addNote }) {
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 16 }}>
         <button className="btn btn-primary" onClick={() => setPage("report")}><FileText size={15} /> Generate Report</button>
         <button className="btn" onClick={() => setPage("live-monitor")}><Waves size={15} /> View Signal Analysis</button>
+        <button className="btn" onClick={() => setPage("baseline")}><GitBranch size={15} /> Baseline Comparison</button>
+        <button className="btn" onClick={() => setPage("replay")}><Play size={15} /> Replay Inspection</button>
+        <button className="btn" onClick={() => setPage("twin")}><Package size={15} /> Digital Twin</button>
         <button className="btn" onClick={() => setPage("history")}><History size={15} /> View History</button>
       </div>
 
@@ -1155,22 +1388,334 @@ function ResultPage({ inspection, setPage, addNote }) {
 }
 
 /* ============================================================
+   BASELINE COMPARISON
+   ============================================================ */
+function BaselineComparisonPage({ inspection, setPage }) {
+  const merged = inspection.amplitudePhase.map((p, i) => {
+    const b = inspection.baseline[i] || { amplitude: p.amplitude, phase: p.phase };
+    return {
+      t: p.t,
+      baselineAmp: b.amplitude, currentAmp: p.amplitude,
+      baselinePhase: b.phase, currentPhase: p.phase,
+      ampDev: +Math.abs(p.amplitude - b.amplitude).toFixed(3),
+    };
+  });
+  const threshold = 0.18;
+  const flagged = merged.filter((m) => m.ampDev > threshold).length;
+
+  return (
+    <div className="fade-up">
+      <SectionHeader title="Baseline Comparison" subtitle={`${inspection.packageId} · Expected baseline CSI vs. current inspection`}
+        right={<>
+          <button className="btn btn-ghost" onClick={() => setPage("ai-analysis")}><ChevronLeft size={14} /> Back</button>
+          <DemoTag />
+        </>}
+      />
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
+        <div className="card" style={{ padding: 16 }}>
+          <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8 }}>Amplitude — Baseline vs Current</div>
+          <ResponsiveContainer width="100%" height={200}>
+            <LineChart data={merged}>
+              <CartesianGrid stroke="var(--hair)" vertical={false} />
+              <XAxis dataKey="t" hide />
+              <YAxis tick={{ fill: "#5b6779", fontSize: 9 }} axisLine={false} tickLine={false} width={26} />
+              <Tooltip contentStyle={{ background: "var(--panel2)", border: "1px solid var(--hair-bright)", borderRadius: 8, fontSize: 12 }} />
+              <Legend wrapperStyle={{ fontSize: 11 }} />
+              <Line type="monotone" dataKey="baselineAmp" name="Baseline" stroke="var(--text3)" strokeDasharray="4 3" strokeWidth={2} dot={false} isAnimationActive={false} />
+              <Line type="monotone" dataKey="currentAmp" name="Current" stroke="var(--cyan)" strokeWidth={2} dot={false} isAnimationActive={false} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+        <div className="card" style={{ padding: 16 }}>
+          <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8 }}>Phase — Baseline vs Current</div>
+          <ResponsiveContainer width="100%" height={200}>
+            <LineChart data={merged}>
+              <CartesianGrid stroke="var(--hair)" vertical={false} />
+              <XAxis dataKey="t" hide />
+              <YAxis tick={{ fill: "#5b6779", fontSize: 9 }} axisLine={false} tickLine={false} width={26} />
+              <Tooltip contentStyle={{ background: "var(--panel2)", border: "1px solid var(--hair-bright)", borderRadius: 8, fontSize: 12 }} />
+              <Legend wrapperStyle={{ fontSize: 11 }} />
+              <Line type="monotone" dataKey="baselinePhase" name="Baseline" stroke="var(--text3)" strokeDasharray="4 3" strokeWidth={2} dot={false} isAnimationActive={false} />
+              <Line type="monotone" dataKey="currentPhase" name="Current" stroke="var(--blue)" strokeWidth={2} dot={false} isAnimationActive={false} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      <div className="card" style={{ padding: 16, marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+          <div style={{ fontWeight: 700, fontSize: 13 }}>Deviation from Baseline (Amplitude)</div>
+          <span className="mono" style={{ fontSize: 11.5, color: "var(--text3)" }}>{flagged} of {merged.length} frames flagged</span>
+        </div>
+        <ResponsiveContainer width="100%" height={140}>
+          <AreaChart data={merged}>
+            <defs>
+              <linearGradient id="devGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={inspection.scenario.color} stopOpacity={0.4} />
+                <stop offset="100%" stopColor={inspection.scenario.color} stopOpacity={0} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid stroke="var(--hair)" vertical={false} />
+            <XAxis dataKey="t" hide />
+            <YAxis tick={{ fill: "#5b6779", fontSize: 9 }} axisLine={false} tickLine={false} width={26} />
+            <Tooltip contentStyle={{ background: "var(--panel2)", border: "1px solid var(--hair-bright)", borderRadius: 8, fontSize: 12 }} />
+            <ReferenceLine y={threshold} stroke="var(--red)" strokeDasharray="4 3" label={{ value: "Threshold", fill: "var(--red)", fontSize: 10 }} />
+            <Area type="monotone" dataKey="ampDev" name="Amplitude deviation" stroke={inspection.scenario.color} fill="url(#devGrad)" strokeWidth={2} isAnimationActive={false} />
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+
+      <div className="card" style={{ padding: 14, fontSize: 12, color: "var(--text2)", lineHeight: 1.6 }}>
+        Highlighted regions represent deviations from the expected CSI signature. This indicates a <b>potential anomaly region</b> — a significant baseline deviation, not confirmation of a physical crack or defect. Secondary inspection is recommended to verify high-risk findings.
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   INSPECTION REPLAY
+   ============================================================ */
+const REPLAY_STAGES = [
+  { label: "Package Enters", at: 0 },
+  { label: "CSI Signal Acquired", at: 0.2 },
+  { label: "Signal Processing", at: 0.45 },
+  { label: "Anomaly Region", at: 0.7 },
+  { label: "Final Score", at: 0.95 },
+];
+
+function InspectionReplayPage({ inspection, setPage }) {
+  const data = inspection.amplitudePhase;
+  const [index, setIndex] = useState(0);
+  const [playing, setPlaying] = useState(true);
+  const intervalRef = useRef(null);
+
+  useEffect(() => {
+    if (playing) {
+      intervalRef.current = setInterval(() => {
+        setIndex((i) => {
+          if (i >= data.length - 1) { setPlaying(false); return i; }
+          return i + 1;
+        });
+      }, 140);
+    }
+    return () => clearInterval(intervalRef.current);
+  }, [playing, data.length]);
+
+  const progress = data.length > 1 ? index / (data.length - 1) : 0;
+  const stage = [...REPLAY_STAGES].reverse().find((st) => progress >= st.at) || REPLAY_STAGES[0];
+  const point = data[index] || data[0];
+  const visible = data.slice(0, index + 1);
+  const replay = () => { setIndex(0); setPlaying(true); };
+
+  return (
+    <div className="fade-up">
+      <SectionHeader title="Inspection Replay" subtitle={`${inspection.packageId} · Simulated CSI scan playback`}
+        right={<>
+          <button className="btn btn-ghost" onClick={() => setPage("ai-analysis")}><ChevronLeft size={14} /> Back</button>
+          <DemoTag />
+        </>}
+      />
+
+      <div className="card" style={{ padding: 20, marginBottom: 14 }}>
+        <div style={{ position: "relative", height: 46, marginBottom: 18 }}>
+          <div style={{ position: "absolute", top: 22, left: 0, right: 0, height: 3, background: "var(--hair)", borderRadius: 4 }} />
+          <div style={{ position: "absolute", top: 22, left: 0, width: `${progress * 100}%`, height: 3, background: "var(--cyan)", borderRadius: 4, transition: "width .1s linear" }} />
+          <div style={{
+            position: "absolute", top: 8, left: `calc(${progress * 100}% - 14px)`, width: 28, height: 28, borderRadius: 8,
+            background: "linear-gradient(135deg,#1c93ab,#0b3a44)", display: "flex", alignItems: "center", justifyContent: "center",
+            transition: "left .1s linear", boxShadow: "0 0 0 4px var(--panel)"
+          }}>
+            <Package size={14} color="#bdf3ff" />
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 18 }}>
+          {REPLAY_STAGES.map((st) => (
+            <span key={st.label} className="mono" style={{
+              fontSize: 10.5, padding: "4px 9px", borderRadius: 5,
+              color: stage.label === st.label ? "var(--cyan)" : progress >= st.at ? "var(--green)" : "var(--text3)",
+              background: stage.label === st.label ? "rgba(45,212,238,0.1)" : progress >= st.at ? "var(--green-dim)" : "var(--panel2)",
+              border: `1px solid ${stage.label === st.label ? "var(--cyan-dim)" : "var(--hair)"}`
+            }}>{st.label}</span>
+          ))}
+        </div>
+
+        <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 16 }}>
+          {[
+            ["Time", `t = ${point ? point.t : 0}`],
+            ["Amplitude", point ? point.amplitude.toFixed(3) : "—"],
+            ["Phase", point ? point.phase.toFixed(3) : "—"],
+            ["Stage", stage.label],
+          ].map(([k, v]) => (
+            <div key={k} className="card" style={{ padding: "10px 14px", flex: 1, minWidth: 140 }}>
+              <div style={{ fontSize: 10, color: "var(--text3)", textTransform: "uppercase" }}>{k}</div>
+              <div className="mono" style={{ fontSize: 14, fontWeight: 700, marginTop: 3 }}>{v}</div>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ display: "flex", gap: 8 }}>
+          <button className="btn" onClick={() => setPlaying((p) => !p)}>{playing ? <Pause size={14} /> : <Play size={14} />} {playing ? "Pause" : "Play"}</button>
+          <button className="btn" onClick={replay}><RotateCcw size={14} /> Replay</button>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+        <div className="card" style={{ padding: 16 }}>
+          <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8 }}>Amplitude</div>
+          <ResponsiveContainer width="100%" height={160}>
+            <LineChart data={visible}>
+              <CartesianGrid stroke="var(--hair)" vertical={false} />
+              <XAxis dataKey="t" type="number" domain={[0, data.length - 1]} hide />
+              <YAxis tick={{ fill: "#5b6779", fontSize: 9 }} axisLine={false} tickLine={false} width={26} domain={["auto", "auto"]} />
+              <Line type="monotone" dataKey="amplitude" stroke="var(--cyan)" strokeWidth={2} dot={false} isAnimationActive={false} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+        <div className="card" style={{ padding: 16 }}>
+          <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8 }}>Phase</div>
+          <ResponsiveContainer width="100%" height={160}>
+            <LineChart data={visible}>
+              <CartesianGrid stroke="var(--hair)" vertical={false} />
+              <XAxis dataKey="t" type="number" domain={[0, data.length - 1]} hide />
+              <YAxis tick={{ fill: "#5b6779", fontSize: 9 }} axisLine={false} tickLine={false} width={26} domain={["auto", "auto"]} />
+              <Line type="monotone" dataKey="phase" stroke="var(--blue)" strokeWidth={2} dot={false} isAnimationActive={false} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   PACKAGE DIGITAL TWIN
+   ============================================================ */
+function PackageTwinPage({ inspection, setPage }) {
+  const s = inspection.scenario;
+  const priorScans = useMemo(() => {
+    const seed = (inspection.packageId || "PKG").split("").reduce((a, c) => a + c.charCodeAt(0), 0);
+    return [0, 1].map((i) => {
+      const rnd = seededNoise(seed + i * 91 + 3);
+      const daysAgo = 4 + i * 9;
+      const d = new Date(inspection.timestamp);
+      d.setDate(d.getDate() - daysAgo);
+      const score = Math.max(2, Math.min(20, 8 + (rnd() - 0.5) * 12));
+      return { date: fmtDate(d), result: "PASS", anomalyScore: +score.toFixed(1), risk: "LOW" };
+    });
+  }, [inspection.packageId, inspection.timestamp]);
+
+  return (
+    <div className="fade-up">
+      <SectionHeader title="Package Digital Twin" subtitle="Consolidated live profile for this package"
+        right={<>
+          <button className="btn btn-ghost" onClick={() => setPage("ai-analysis")}><ChevronLeft size={14} /> Back</button>
+          <DemoTag />
+        </>}
+      />
+
+      <div className="card" style={{ padding: 22, marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 18 }}>
+          <div style={{ display: "flex", gap: 16, alignItems: "center" }}>
+            <div style={{ width: 54, height: 54, borderRadius: 12, background: "var(--panel2)", border: "1px solid var(--hair)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <Package size={26} color="var(--cyan)" />
+            </div>
+            <div>
+              <div className="mono" style={{ fontSize: 20, fontWeight: 800 }}>{inspection.packageId}</div>
+              <div style={{ fontSize: 12.5, color: "var(--text2)", marginTop: 2 }}>{inspection.productType}</div>
+              <div style={{ fontSize: 11.5, color: "var(--text3)", marginTop: 4, display: "flex", alignItems: "center", gap: 6 }}>
+                {inspection.origin} <ArrowRight size={11} /> {inspection.destination}
+              </div>
+            </div>
+          </div>
+          <ResultBadge result={inspection.result === "PASS" ? "PASS" : "ANOMALY"} />
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: 14, marginBottom: 14 }}>
+        {[
+          ["Shipment ID", inspection.shipmentId],
+          ["Sensor Node", inspection.sensorNode],
+          ["Anomaly Score", `${inspection.anomalyScore.toFixed(1)}%`],
+          ["Confidence", `${inspection.confidence.toFixed(1)}%`],
+          ["Risk", null],
+        ].map(([k, v]) => (
+          <div key={k} className="card" style={{ padding: 14 }}>
+            <div style={{ fontSize: 10, color: "var(--text3)", textTransform: "uppercase" }}>{k}</div>
+            <div className="mono" style={{ fontSize: 14, fontWeight: 700, marginTop: 4 }}>{k === "Risk" ? <RiskBadge risk={inspection.risk} /> : v}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
+        <div className="card" style={{ padding: 16 }}>
+          <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8 }}>CSI Status</div>
+          <div style={{ fontSize: 12.5, color: "var(--text2)", marginBottom: 10 }}>
+            {inspection.result === "PASS" ? "Signal matches expected baseline." : "Signal deviates from expected baseline — see comparison below."}
+          </div>
+          <MiniLineChart data={inspection.amplitudePhase} dataKey="amplitude" color={s.color} height={80} />
+          <button className="btn" style={{ marginTop: 10 }} onClick={() => setPage("baseline")}><Waves size={13} /> View Baseline Comparison</button>
+        </div>
+        <div className="card" style={{ padding: 16 }}>
+          <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 10 }}>Recommended Action</div>
+          <div style={{ fontSize: 14, fontWeight: 700, color: s.color, marginBottom: 14 }}>{s.action}</div>
+          <button className="btn btn-primary" onClick={() => setPage("report")}><FileText size={13} /> Generate Report</button>
+        </div>
+      </div>
+
+      <div className="card" style={{ padding: 0, overflow: "hidden" }}>
+        <div style={{ padding: "14px 18px", borderBottom: "1px solid var(--hair)", fontWeight: 700, fontSize: 13.5 }}>
+          Previous Scans <span style={{ fontWeight: 400, color: "var(--text3)", fontSize: 11.5 }}>(simulated for demonstration)</span>
+        </div>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5 }}>
+          <thead>
+            <tr style={{ textAlign: "left", color: "var(--text3)", fontSize: 10.5, textTransform: "uppercase" }}>
+              {["Date", "Result", "Anomaly Score", "Risk"].map((h) => <th key={h} style={{ padding: "9px 18px", borderBottom: "1px solid var(--hair)" }}>{h}</th>)}
+            </tr>
+          </thead>
+          <tbody>
+            {priorScans.map((p, i) => (
+              <tr key={i} style={{ borderBottom: "1px solid var(--hair)" }}>
+                <td className="mono" style={{ padding: "9px 18px", color: "var(--text3)" }}>{p.date}</td>
+                <td style={{ padding: "9px 18px" }}><ResultBadge result={p.result} /></td>
+                <td className="mono" style={{ padding: "9px 18px" }}>{p.anomalyScore}%</td>
+                <td style={{ padding: "9px 18px" }}><RiskBadge risk={p.risk} /></td>
+              </tr>
+            ))}
+            <tr>
+              <td className="mono" style={{ padding: "9px 18px", color: "var(--text3)" }}>{fmtDate(inspection.timestamp)}</td>
+              <td style={{ padding: "9px 18px" }}><ResultBadge result={inspection.result === "PASS" ? "PASS" : "ANOMALY"} /></td>
+              <td className="mono" style={{ padding: "9px 18px" }}>{inspection.anomalyScore.toFixed(1)}%</td>
+              <td style={{ padding: "9px 18px" }}><RiskBadge risk={inspection.risk} /></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
    INSPECTION HISTORY
    ============================================================ */
-function HistoryPage({ history, openInspection }) {
+function HistoryPage({ allRecords, openInspection }) {
   const [filter, setFilter] = useState("All");
   const [query, setQuery] = useState("");
-  const filtered = history.filter((r) => {
+  const filtered = useMemo(() => allRecords.filter((r) => {
     if (filter === "Passed" && r.result !== "PASS") return false;
     if (filter === "Anomaly" && r.result !== "ANOMALY") return false;
     if (filter === "High Risk" && r.risk !== "HIGH") return false;
     if (filter === "Pending Review" && r.risk !== "MEDIUM") return false;
-    if (query && !(`${r.pkg} ${r.inspId}`.toLowerCase().includes(query.toLowerCase()))) return false;
+    if (query) {
+      const q = query.toLowerCase();
+      if (!(`${r.pkg} ${r.inspId} ${r.shipmentId}`.toLowerCase().includes(q))) return false;
+    }
     return true;
-  });
+  }), [allRecords, filter, query]);
+  const visible = filtered.slice(0, 200);
+
   return (
     <div className="fade-up">
-      <SectionHeader title="Inspection History" subtitle={`${history.length} total inspections on record`} />
+      <SectionHeader title="Inspection History" subtitle={`${allRecords.length.toLocaleString()} total inspections on record`} />
       <div className="card" style={{ padding: "12px 16px", display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", marginBottom: 14 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, background: "var(--panel2)", border: "1px solid var(--hair)", borderRadius: 8, padding: "8px 12px", flex: 1, minWidth: 220 }}>
           <Search size={14} color="var(--text3)" />
@@ -1195,26 +1740,31 @@ function HistoryPage({ history, openInspection }) {
               </tr>
             </thead>
             <tbody>
-              {filtered.map((r) => (
+              {visible.map((r) => (
                 <tr key={r.id} style={{ borderBottom: "1px solid var(--hair)", cursor: "pointer" }} onClick={() => openInspection(r)}
                   onMouseEnter={(e) => e.currentTarget.style.background = "var(--panel2)"} onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}>
                   <td className="mono" style={{ padding: "11px 16px" }}>{r.inspId}</td>
                   <td className="mono" style={{ padding: "11px 16px", fontWeight: 600 }}>{r.pkg}</td>
                   <td style={{ padding: "11px 16px", color: "var(--text2)" }}>{r.product}</td>
                   <td style={{ padding: "11px 16px" }}><ResultBadge result={r.result} /></td>
-                  <td className="mono" style={{ padding: "11px 16px" }}>{r.conf}%</td>
+                  <td className="mono" style={{ padding: "11px 16px" }} title="Model classification confidence">{r.conf}%</td>
                   <td style={{ padding: "11px 16px" }}><RiskBadge risk={r.risk} /></td>
                   <td className="mono" style={{ padding: "11px 16px", color: "var(--text3)" }}>{r.date}</td>
                   <td style={{ padding: "11px 16px", color: "var(--text2)" }}>{r.inspector}</td>
                   <td style={{ padding: "11px 16px" }}><ChevronRight size={14} color="var(--text3)" /></td>
                 </tr>
               ))}
-              {filtered.length === 0 && (
+              {visible.length === 0 && (
                 <tr><td colSpan={9} style={{ padding: 24, textAlign: "center", color: "var(--text3)" }}>No inspections match this filter.</td></tr>
               )}
             </tbody>
           </table>
         </div>
+        {filtered.length > visible.length && (
+          <div style={{ padding: "10px 16px", fontSize: 11.5, color: "var(--text3)", borderTop: "1px solid var(--hair)" }}>
+            Showing the latest {visible.length} of {filtered.length.toLocaleString()} matching records — refine your search or filters to narrow further.
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1223,18 +1773,60 @@ function HistoryPage({ history, openInspection }) {
 /* ============================================================
    ALERTS
    ============================================================ */
-function AlertsPage({ history, resolveAlert, resolved, openInspection, setPage, setActive }) {
-  const alerts = history.filter((r) => r.result === "ANOMALY").map((r) => ({
-    ...r, severity: r.risk === "HIGH" ? "Critical" : r.risk === "MEDIUM" ? "High" : "Medium",
-  }));
-  const groups = ["Critical", "High", "Medium", "Low"];
+function EscalationTimeline({ record }) {
+  const base = record.timestamp;
+  const steps = [
+    { label: "Anomaly detected", offset: 0 },
+    { label: `Risk classified as ${record.risk}`, offset: 1 },
+    { label: record.risk === "HIGH" ? "Shipment HOLD initiated" : "Flagged for review", offset: 2 },
+    { label: "QC notification generated", offset: 3 },
+    { label: "Secondary inspection recommended", offset: 4 },
+  ];
+  return (
+    <div style={{ marginTop: 14, paddingTop: 14, borderTop: "1px solid var(--hair)" }}>
+      {record.risk === "HIGH" && (
+        <div className="badge" style={{ color: "var(--red)", background: "var(--red-dim)", marginBottom: 10 }}>
+          <AlertTriangle size={11} /> HIGH RISK ANOMALY DETECTED
+        </div>
+      )}
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {steps.map((st, i) => {
+          const t = new Date(base.getTime() + st.offset * 1000);
+          return (
+            <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12.5 }}>
+              <span className="mono" style={{ color: "var(--text3)", width: 78, flexShrink: 0 }}>{t.toLocaleTimeString([], { hour12: false })}</span>
+              <CheckCircle2 size={13} color="var(--green)" />
+              <span style={{ color: "var(--text2)" }}>{st.label}</span>
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ marginTop: 10, fontSize: 11, color: "var(--text3)" }}>
+        Simulated workflow — no real SMS/email/WhatsApp notifications are sent in this prototype.
+      </div>
+    </div>
+  );
+}
+
+function AlertsPage({ dataset, allRecords, resolveAlert, resolved, openInspection, openTwin }) {
+  const [expanded, setExpanded] = useState({});
+  const todayRecords = useMemo(() => getRangeRecords(allRecords, dataset, "Today"), [allRecords, dataset]);
+  const alerts = useMemo(() => todayRecords
+    .filter((r) => r.result === "ANOMALY")
+    .sort((a, b) => b.timestamp - a.timestamp)
+    .slice(0, 40)
+    .map((r) => ({ ...r, severity: r.risk === "HIGH" ? "Critical" : r.risk === "MEDIUM" ? "High" : "Medium" })),
+    [todayRecords]);
+  const toggle = (id) => setExpanded((e) => ({ ...e, [id]: !e[id] }));
+
   return (
     <div className="fade-up">
-      <SectionHeader title="Alert Center" subtitle="Anomalies requiring review or secondary inspection" />
+      <SectionHeader title="Alert Center" subtitle="Anomalies requiring review or secondary inspection — today" />
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
         {alerts.length === 0 && <div className="card" style={{ padding: 24, textAlign: "center", color: "var(--text3)" }}>No active alerts.</div>}
         {alerts.map((a) => {
           const isResolved = resolved.includes(a.id);
+          const isExpanded = !!expanded[a.id];
           const sevColor = a.severity === "Critical" ? "var(--red)" : a.severity === "High" ? "var(--amber)" : "var(--blue)";
           return (
             <div key={a.id} className="card" style={{ padding: 16, borderLeft: `3px solid ${sevColor}`, opacity: isResolved ? 0.55 : 1 }}>
@@ -1248,14 +1840,16 @@ function AlertsPage({ history, resolveAlert, resolved, openInspection, setPage, 
                   </div>
                   <div style={{ fontSize: 14, fontWeight: 700 }}>Package: <span className="mono">{a.pkg}</span></div>
                   <div style={{ fontSize: 12.5, color: "var(--text2)", marginTop: 3 }}>Detected: {SCENARIOS[a.scenario].classification}</div>
-                  <div style={{ fontSize: 12.5, color: "var(--text2)" }}>Confidence: <span className="mono">{a.conf}%</span> · Action: {SCENARIOS[a.scenario].action}</div>
+                  <div style={{ fontSize: 12.5, color: "var(--text2)" }}>Model Classification Confidence: <span className="mono">{a.conf}%</span> · Action: {SCENARIOS[a.scenario].action}</div>
                 </div>
-                <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                <div style={{ display: "flex", gap: 8, alignItems: "flex-start", flexWrap: "wrap" }}>
                   <button className="btn" onClick={() => openInspection(a)}><Eye size={13} /> Review</button>
+                  <button className="btn" onClick={() => openTwin(a)}><Package size={13} /> Twin</button>
                   <button className="btn" disabled={isResolved} onClick={() => resolveAlert(a.id)}><CheckCircle2 size={13} /> Resolve</button>
-                  <button className="btn" onClick={() => { setActive(buildInspection(a.scenario, { packageId: a.pkg }, a.id)); setPage("report"); }}><FileText size={13} /> Report</button>
+                  <button className="btn" onClick={() => toggle(a.id)}>{isExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />} Timeline</button>
                 </div>
               </div>
+              {isExpanded && <EscalationTimeline record={a} />}
             </div>
           );
         })}
@@ -1267,50 +1861,50 @@ function AlertsPage({ history, resolveAlert, resolved, openInspection, setPage, 
 /* ============================================================
    ANALYTICS
    ============================================================ */
-function AnalyticsPage({ history }) {
+function AnalyticsPage({ dataset, allRecords, liveCount }) {
   const [range, setRange] = useState("7 Days");
-  const byProduct = useMemo(() => {
-    const m = {};
-    history.forEach((r) => { m[r.product] = (m[r.product] || 0) + (r.result === "ANOMALY" ? 1 : 0); });
-    return Object.entries(m).map(([name, value]) => ({ name, value }));
-  }, [history]);
-  const volumeData = useMemo(() => Array.from({ length: 14 }, (_, i) => ({
-    day: `D${i + 1}`, volume: Math.round(60 + Math.sin(i / 2) * 30 + (i % 3) * 8)
-  })), []);
+  const rangeRecords = useMemo(() => getRangeRecords(allRecords, dataset, range), [allRecords, dataset, range]);
+  const summary = useMemo(() => summarize(rangeRecords), [rangeRecords]);
+  const volumeData = useMemo(() => getVolumeSeries(dataset, range, liveCount), [dataset, range, liveCount]);
+  const byProduct = Object.keys(PRODUCT_WEIGHTS).map((name) => ({ name, value: summary.byProduct[name] || 0 }));
+  const byDestination = DESTINATIONS.map((name) => ({ name, value: summary.byDestination[name] || 0 }));
   const riskDist = [
-    { name: "Low", value: 1197, color: "var(--green)" },
-    { name: "Medium", value: 41, color: "var(--amber)" },
-    { name: "High", value: 12, color: "var(--red)" },
+    { name: "Low", value: summary.passed, color: "var(--green)" },
+    { name: "Medium", value: summary.medium, color: "var(--amber)" },
+    { name: "High", value: summary.high, color: "var(--red)" },
   ];
-  const byDestination = [
-    { name: "Bengaluru", value: 412 }, { name: "Pune", value: 305 }, { name: "Chennai", value: 261 }, { name: "Delhi NCR", value: 198 }, { name: "Hyderabad", value: 108 },
-  ];
+
   return (
     <div className="fade-up">
-      <SectionHeader title="Analytics" subtitle="Cross-inspection trends and quality metrics"
+      <SectionHeader title="Analytics" subtitle="Cross-inspection trends — derived live from the centralized inspection dataset"
         right={<>
           {["Today", "7 Days", "30 Days", "Custom"].map((r) => (
             <button key={r} className="btn" style={{ padding: "7px 12px", background: range === r ? "var(--panel3)" : "var(--panel2)", borderColor: range === r ? "var(--cyan-dim)" : "var(--hair)", color: range === r ? "var(--cyan)" : "var(--text2)" }} onClick={() => setRange(r)}>{r}</button>
           ))}
         </>}
       />
+      {range === "Custom" && (
+        <div className="card" style={{ padding: "10px 14px", marginBottom: 14, fontSize: 12, color: "var(--text3)" }}>
+          Custom date-range picker isn't wired up in this prototype yet — showing the last 30 days.
+        </div>
+      )}
       <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 16 }}>
-        <KPICard icon={Package} label="Total Inspections" value="8,942" sub={range} />
-        <KPICard icon={ShieldCheck} label="Pass Rate" value="93.2%" accent="var(--green)" />
-        <KPICard icon={AlertTriangle} label="Anomaly Rate" value="6.8%" accent="var(--amber)" />
-        <KPICard icon={ShieldAlert} label="High Risk Rate" value="1.3%" accent="var(--red)" />
+        <KPICard icon={Package} label="Total Inspections" value={summary.total.toLocaleString()} sub={range} />
+        <KPICard icon={ShieldCheck} label="Pass Rate" value={`${summary.passRate.toFixed(1)}%`} accent="var(--green)" />
+        <KPICard icon={AlertTriangle} label="Anomaly Rate" value={`${summary.anomalyRate.toFixed(1)}%`} accent="var(--amber)" />
+        <KPICard icon={ShieldAlert} label="High Risk Rate" value={`${summary.highRiskRate.toFixed(1)}%`} accent="var(--red)" />
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
         <div className="card" style={{ padding: 18 }}>
-          <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 10 }}>Inspection Volume Over Time</div>
+          <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 10 }}>Packages Inspected Over Time</div>
           <ResponsiveContainer width="100%" height={180}>
             <AreaChart data={volumeData}>
               <defs><linearGradient id="volGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="var(--blue)" stopOpacity={0.35} /><stop offset="100%" stopColor="var(--blue)" stopOpacity={0} /></linearGradient></defs>
               <CartesianGrid stroke="var(--hair)" vertical={false} />
-              <XAxis dataKey="day" tick={{ fill: "#5b6779", fontSize: 10 }} axisLine={{ stroke: "var(--hair)" }} tickLine={false} />
-              <YAxis tick={{ fill: "#5b6779", fontSize: 10 }} axisLine={false} tickLine={false} width={28} />
+              <XAxis dataKey="date" tick={{ fill: "#5b6779", fontSize: 10 }} axisLine={{ stroke: "var(--hair)" }} tickLine={false} interval={range === "Today" ? 3 : range === "30 Days" ? 3 : 0} />
+              <YAxis tick={{ fill: "#5b6779", fontSize: 10 }} axisLine={false} tickLine={false} width={36} domain={["auto", "auto"]} />
               <Tooltip contentStyle={{ background: "var(--panel2)", border: "1px solid var(--hair-bright)", borderRadius: 8, fontSize: 12 }} />
-              <Area type="monotone" dataKey="volume" stroke="var(--blue)" fill="url(#volGrad)" strokeWidth={2} />
+              <Area type="monotone" dataKey="count" stroke="var(--blue)" fill="url(#volGrad)" strokeWidth={2} />
             </AreaChart>
           </ResponsiveContainer>
         </div>
@@ -1339,8 +1933,9 @@ function AnalyticsPage({ history }) {
           </ResponsiveContainer>
         </div>
         <div className="card" style={{ padding: 18 }}>
-          <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 10 }}>Anomalies by Destination</div>
-          <ResponsiveContainer width="100%" height={180}>
+          <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 6 }}>Anomalies by Destination</div>
+          <div style={{ fontSize: 10.5, color: "var(--text3)", marginBottom: 8 }}>Observed anomaly counts by destination in the demo dataset — not a claim that a destination causes anomalies.</div>
+          <ResponsiveContainer width="100%" height={164}>
             <BarChart data={byDestination}>
               <CartesianGrid stroke="var(--hair)" vertical={false} />
               <XAxis dataKey="name" tick={{ fill: "#5b6779", fontSize: 9.5 }} axisLine={{ stroke: "var(--hair)" }} tickLine={false} />
@@ -1401,9 +1996,16 @@ function ReportPage({ inspection }) {
             <div className="mono" style={{ fontSize: 20, fontWeight: 800 }}>{inspection.anomalyScore.toFixed(1)}%</div>
           </div>
           <div>
+            <div style={{ fontSize: 11, color: "var(--text3)", textTransform: "uppercase" }}>Confidence</div>
+            <div className="mono" style={{ fontSize: 20, fontWeight: 800 }}>{inspection.confidence.toFixed(1)}%</div>
+          </div>
+          <div>
             <div style={{ fontSize: 11, color: "var(--text3)", textTransform: "uppercase" }}>Risk Level</div>
             <RiskBadge risk={inspection.risk} />
           </div>
+        </div>
+        <div style={{ fontSize: 10.5, color: "var(--text3)", marginTop: -12, marginBottom: 20, lineHeight: 1.5 }}>
+          Anomaly Score = prototype deviation-from-baseline score. Confidence = model classification confidence. Neither is a validated probability of physical damage.
         </div>
 
         <div style={{ marginBottom: 20 }}>
@@ -1447,9 +2049,9 @@ function ReportPage({ inspection }) {
 function ConfigPage() {
   const [thresholds, setThresholds] = useState({ low: 30, medium: 60, high: 80 });
   const nodes = [
-    { id: "CSI-NODE-01", loc: "Inspection Zone A", status: "Online", quality: 94 },
-    { id: "CSI-NODE-02", loc: "Inspection Zone B", status: "Online", quality: 89 },
-    { id: "CSI-NODE-03", loc: "Inspection Zone C", status: "Idle", quality: 0 },
+    { id: "CSI-NODE-01", loc: "Inspection Zone A", status: "SIMULATED ONLINE", quality: 94 },
+    { id: "CSI-NODE-02", loc: "Inspection Zone B", status: "SIMULATED ONLINE", quality: 89 },
+    { id: "CSI-NODE-03", loc: "Inspection Zone C", status: "SIMULATED IDLE", quality: 0 },
   ];
   return (
     <div className="fade-up">
@@ -1458,19 +2060,22 @@ function ConfigPage() {
       <div className="card" style={{ padding: 0, marginBottom: 16, overflow: "hidden" }}>
         <div style={{ padding: "14px 18px", fontWeight: 700, fontSize: 13.5, borderBottom: "1px solid var(--hair)" }}>CSI Sensor Nodes</div>
         <div style={{ padding: 16, display: "flex", gap: 14, flexWrap: "wrap" }}>
-          {nodes.map((n) => (
-            <div key={n.id} className="card" style={{ padding: 14, flex: 1, minWidth: 200, background: "var(--panel2)" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <span className="mono" style={{ fontWeight: 700, fontSize: 13 }}>{n.id}</span>
-                <span className="badge" style={{ color: n.status === "Online" ? "var(--green)" : "var(--text3)", background: n.status === "Online" ? "var(--green-dim)" : "var(--panel3)" }}>{n.status}</span>
+          {nodes.map((n) => {
+            const online = n.status.includes("ONLINE");
+            return (
+              <div key={n.id} className="card" style={{ padding: 14, flex: 1, minWidth: 200, background: "var(--panel2)" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span className="mono" style={{ fontWeight: 700, fontSize: 13 }}>{n.id}</span>
+                  <span className="badge mono" style={{ color: online ? "var(--cyan)" : "var(--text3)", background: online ? "rgba(45,212,238,0.1)" : "var(--panel3)" }}>{n.status}</span>
+                </div>
+                <div style={{ fontSize: 12, color: "var(--text2)", marginTop: 6 }}><MapPin size={11} style={{ marginRight: 4, display: "inline" }} />{n.loc}</div>
+                <div style={{ marginTop: 10 }}>
+                  <div style={{ fontSize: 10.5, color: "var(--text3)", marginBottom: 4 }}>Signal Quality</div>
+                  <ProgressBar value={n.quality} color={n.quality > 0 ? "var(--cyan)" : "var(--hair)"} />
+                </div>
               </div>
-              <div style={{ fontSize: 12, color: "var(--text2)", marginTop: 6 }}><MapPin size={11} style={{ marginRight: 4, display: "inline" }} />{n.loc}</div>
-              <div style={{ marginTop: 10 }}>
-                <div style={{ fontSize: 10.5, color: "var(--text3)", marginBottom: 4 }}>Signal Quality</div>
-                <ProgressBar value={n.quality} color={n.quality > 0 ? "var(--cyan)" : "var(--hair)"} />
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
 
@@ -1489,7 +2094,7 @@ function ConfigPage() {
         </div>
         <div className="card" style={{ flex: 1, minWidth: 280, padding: 18 }}>
           <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 10 }}>Package Profiles</div>
-          {PRODUCT_TYPES.slice(0, 5).map((p) => (
+          {Object.keys(PRODUCT_WEIGHTS).map((p) => (
             <div key={p} style={{ display: "flex", justifyContent: "space-between", padding: "7px 0", borderBottom: "1px solid var(--hair)", fontSize: 12.5 }}>
               <span style={{ color: "var(--text2)" }}>{p}</span><span className="mono" style={{ color: "var(--text3)" }}>baseline calibrated</span>
             </div>
@@ -1566,30 +2171,38 @@ export default function App() {
   const [user, setUser] = useState("");
   const [page, setPage] = useState("dashboard");
   const [collapsed, setCollapsed] = useState(false);
-  const [history, setHistory] = useState(buildInitialHistory);
+  const [liveRecords, setLiveRecords] = useState([]);
   const [resolved, setResolved] = useState([]);
   const [notes, setNotes] = useState({});
   const [connected] = useState(false);
   const [form, setForm] = useState({ packageId: "", shipmentId: "", productType: PRODUCT_TYPES[0], packageType: PACKAGE_TYPES[0], origin: "", destination: "", zone: ZONES[0] });
   const [active, setActive] = useState(() => buildInspection("structural", {}, 999));
   const [demo, setDemo] = useState({ active: false, running: false, stepIndex: 0, page: "live-monitor" });
-  const seedRef = useRef(100);
+  const seedRef = useRef(500000); // offset well past the ~110k IDs the centralized dataset uses, so live demo runs never collide with dataset records
   const timerRef = useRef(null);
+  const dataset = DATASET;
+  const allRecords = useMemo(() => [...liveRecords, ...dataset.records], [liveRecords]);
 
-  const openInspection = (row) => {
-    setActive(buildInspection(row.scenario, { packageId: row.pkg }, row.id));
+  const loadInspection = (row) => {
+    const seed = parseInt(String(row.inspId).replace(/\D/g, ""), 10) || 1;
+    setActive(buildInspection(row.scenario, {
+      inspectionId: row.inspId, packageId: row.pkg, shipmentId: row.shipmentId,
+      productType: row.product, destination: row.destination, sensorNode: row.sensorNode,
+      timestamp: row.timestamp, anomalyScore: row.anomalyScore, confidence: row.conf,
+    }, seed));
     setDemo({ active: false, running: false, stepIndex: 0, page: "live-monitor" });
-    setPage("ai-analysis");
   };
+  const openInspection = (row) => { loadInspection(row); setPage("ai-analysis"); };
+  const openTwin = (row) => { loadInspection(row); setPage("twin"); };
 
   const addNote = (id, text) => setNotes((n) => ({ ...n, [id]: text }));
-
   const resolveAlert = (id) => setResolved((r) => [...r, id]);
 
   const runDemo = useCallback((scenarioKey) => {
     clearInterval(timerRef.current);
     seedRef.current += 1;
-    const insp = buildInspection(scenarioKey, form, seedRef.current);
+    const seed = seedRef.current;
+    const insp = buildInspection(scenarioKey, form, seed);
     setActive(insp);
     setPage("live-monitor");
     setDemo({ active: true, running: true, stepIndex: 0, page: "live-monitor" });
@@ -1601,11 +2214,14 @@ export default function App() {
         clearInterval(timerRef.current);
         setDemo({ active: true, running: false, stepIndex: DEMO_STEPS.length - 1, page: "ai-analysis" });
         setPage("ai-analysis");
-        setHistory((h) => [{
-          id: -Date.now(), pkg: insp.packageId, product: insp.productType, scenario: insp.scenarioKey,
-          conf: insp.anomalyScore, time: insp.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-          date: insp.timestamp.toLocaleDateString(), inspector: insp.inspector, inspId: insp.inspectionId,
-          result: insp.result === "PASS" ? "PASS" : "ANOMALY", risk: insp.risk,
+        setLiveRecords((h) => [{
+          id: insp.inspectionId, inspId: insp.inspectionId, pkg: insp.packageId,
+          shipmentId: insp.shipmentId, product: insp.productType, destination: insp.destination,
+          scenario: insp.scenarioKey, result: insp.result === "PASS" ? "PASS" : "ANOMALY",
+          risk: insp.risk, anomalyScore: insp.anomalyScore, conf: insp.confidence,
+          sensorNode: insp.sensorNode, dayIndex: DATASET.dates.length - 1,
+          date: fmtDate(insp.timestamp), time: insp.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+          timestamp: insp.timestamp, inspector: insp.inspector,
         }, ...h]);
         return;
       }
@@ -1633,18 +2249,21 @@ export default function App() {
     );
   }
 
-  const alertCount = history.filter((r) => r.result === "ANOMALY" && !resolved.includes(r.id)).length;
+  const alertCount = getRangeRecords(allRecords, dataset, "Today").filter((r) => r.result === "ANOMALY" && !resolved.includes(r.id)).length;
 
   let content;
   switch (page) {
-    case "dashboard": content = <DashboardPage history={history} setPage={setPage} openInspection={openInspection} runDemo={runDemo} />; break;
+    case "dashboard": content = <DashboardPage dataset={dataset} allRecords={allRecords} liveCount={liveRecords.length} setPage={setPage} openInspection={openInspection} openTwin={openTwin} runDemo={runDemo} />; break;
     case "new-inspection": content = <NewInspectionPage form={form} setForm={setForm} runDemo={runDemo} startLive={startLive} />; break;
     case "live-monitor": content = <LiveMonitorPage inspection={active} demo={demo} connected={connected} />; break;
-    case "ai-analysis": content = <AIAnalysisPage inspection={active} demo={demo} goResult={goResult} />; break;
+    case "ai-analysis": content = <AIAnalysisPage inspection={active} demo={demo} goResult={goResult} setPage={setPage} />; break;
     case "result": content = <ResultPage inspection={active} setPage={setPage} addNote={addNote} />; break;
-    case "history": content = <HistoryPage history={history} openInspection={openInspection} />; break;
-    case "alerts": content = <AlertsPage history={history} resolveAlert={resolveAlert} resolved={resolved} openInspection={openInspection} setPage={setPage} setActive={setActive} />; break;
-    case "analytics": content = <AnalyticsPage history={history} />; break;
+    case "baseline": content = <BaselineComparisonPage inspection={active} setPage={setPage} />; break;
+    case "replay": content = <InspectionReplayPage inspection={active} setPage={setPage} />; break;
+    case "twin": content = <PackageTwinPage inspection={active} setPage={setPage} />; break;
+    case "history": content = <HistoryPage allRecords={allRecords} openInspection={openInspection} />; break;
+    case "alerts": content = <AlertsPage dataset={dataset} allRecords={allRecords} resolveAlert={resolveAlert} resolved={resolved} openInspection={openInspection} openTwin={openTwin} />; break;
+    case "analytics": content = <AnalyticsPage dataset={dataset} allRecords={allRecords} liveCount={liveRecords.length} />; break;
     case "report": content = <ReportPage inspection={active} />; break;
     case "config": content = <ConfigPage />; break;
     case "about": content = <AboutPage />; break;
